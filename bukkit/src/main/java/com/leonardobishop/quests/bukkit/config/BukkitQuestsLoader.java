@@ -39,6 +39,7 @@ import org.bukkit.inventory.ItemStack;
 import java.io.File;
 import java.io.IOException;
 import java.net.URI;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.FileVisitResult;
 import java.nio.file.FileVisitor;
 import java.nio.file.Files;
@@ -146,7 +147,7 @@ public class BukkitQuestsLoader implements QuestsLoader {
                     }
 
                     // process macros -- start
-                    String data = Files.readAllLines(path).stream().reduce("", (a, b) -> a + "\n" + b);
+                    String data = Files.readString(path, StandardCharsets.UTF_8);
                     StringBuilder processed = new StringBuilder();
                     Matcher matcher = macroPattern.matcher(data);
 

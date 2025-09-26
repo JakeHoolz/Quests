@@ -656,16 +656,26 @@ public class BukkitQuestsPlugin extends JavaPlugin implements Quests {
     public void reloadQuests() {
         if (this.reloadBaseConfiguration(false)) {
             BukkitQuestsLoader questsLoader = new BukkitQuestsLoader(this);
-            questsLoader.loadQuestItems(new File(super.getDataFolder() + File.separator + "items"));
-            configProblems = questsLoader.loadQuests(new File(super.getDataFolder() + File.separator + "quests"));
+            File itemsFolder = new File(super.getDataFolder() + File.separator + "items");
+            File questsFolder = new File(super.getDataFolder() + File.separator + "quests");
+            Map<String, String> macroSnapshot = questsLoader.createMacroSnapshot();
 
-            for (TaskType taskType : taskTypeManager.getTaskTypes()) {
-                try {
-                    taskType.onReady();
-                } catch (Exception e) {
-                    e.printStackTrace();
-                }
-            }
+            this.serverScheduler.runTaskAsynchronously(() -> {
+                BukkitQuestsLoader.QuestParsingResult parsingResult = questsLoader.parseQuestFiles(questsFolder, macroSnapshot);
+
+                this.serverScheduler.runTask(() -> {
+                    questsLoader.loadQuestItems(itemsFolder);
+                    configProblems = questsLoader.applyParsedQuests(parsingResult);
+
+                    for (TaskType taskType : taskTypeManager.getTaskTypes()) {
+                        try {
+                            taskType.onReady();
+                        } catch (Exception e) {
+                            e.printStackTrace();
+                        }
+                    }
+                });
+            });
         } else {
             configProblems = Collections.singletonMap("<MAIN CONFIG> config.yml",
                     Collections.singletonList(new ConfigProblem(ConfigProblem.ConfigProblemType.ERROR, ConfigProblemDescriptions.MALFORMED_YAML.getDescription(), ConfigProblemDescriptions.MALFORMED_YAML.getExtendedDescription())));

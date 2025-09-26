@@ -48,14 +48,15 @@ import java.nio.file.attribute.BasicFileAttributes;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -71,6 +72,7 @@ public class BukkitQuestsLoader implements QuestsLoader {
     private final QuestsLogger questsLogger;
     private final QItemStackRegistry qItemStackRegistry;
     private final QuestItemRegistry questItemRegistry;
+    private final Map<Path, CachedQuestFile> questFileCache = new ConcurrentHashMap<>();
 
     private static final Pattern MACRO_PATTERN = Pattern.compile("<\\$m\\s*([^ ]+)\\s*\\$>");
 
@@ -131,57 +133,127 @@ public class BukkitQuestsLoader implements QuestsLoader {
 
         questPaths.sort((first, second) -> toRelativeQuestPath(root, first).compareTo(toRelativeQuestPath(root, second)));
 
-        ConcurrentMap<String, QuestFileData> concurrentQuestFiles = new ConcurrentHashMap<>();
-        ConcurrentMap<String, List<ConfigProblem>> concurrentConfigProblems = new ConcurrentHashMap<>();
-
-        int threadCount = Math.max(1, Math.min(questPaths.size(), Runtime.getRuntime().availableProcessors()));
-        ExecutorService executor = Executors.newFixedThreadPool(threadCount);
-        List<Future<?>> futures = new ArrayList<>();
+        int macroSnapshotHash = macroSnapshot != null ? macroSnapshot.hashCode() : 0;
+        Map<String, QuestFileData> reusedQuestFiles = new HashMap<>();
+        Map<String, List<ConfigProblem>> reusedConfigProblems = new HashMap<>();
+        Map<Path, String> relativePathByPath = new HashMap<>();
+        List<Path> pathsToParse = new ArrayList<>();
+        Set<Path> currentAbsolutePaths = new HashSet<>();
 
         for (Path path : questPaths) {
-            futures.add(executor.submit(() -> parseQuestFile(path, root, macroSnapshot, concurrentQuestFiles, concurrentConfigProblems)));
-        }
+            Path absolutePath = path.toAbsolutePath().normalize();
+            currentAbsolutePaths.add(absolutePath);
+            String relativePath = toRelativeQuestPath(root, path);
+            relativePathByPath.put(path, relativePath);
 
-        for (Future<?> future : futures) {
+            long lastModified;
             try {
-                future.get();
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                break;
-            } catch (ExecutionException e) {
-                questsLogger.severe("An exception occurred when attempting to read a quest file (will be ignored)");
-                e.getCause().printStackTrace();
+                lastModified = Files.getLastModifiedTime(path).toMillis();
+            } catch (IOException e) {
+                lastModified = -1L;
+            }
+
+            CachedQuestFile cachedQuestFile = questFileCache.get(absolutePath);
+            if (cachedQuestFile != null
+                    && cachedQuestFile.getLastModified() == lastModified
+                    && cachedQuestFile.getMacroSnapshotHash() == macroSnapshotHash) {
+                QuestFileData questFileData = cachedQuestFile.copyQuestFileData();
+                if (questFileData != null) {
+                    reusedQuestFiles.put(relativePath, questFileData);
+                }
+                List<ConfigProblem> cachedProblems = cachedQuestFile.getConfigProblemsCopy();
+                if (!cachedProblems.isEmpty()) {
+                    reusedConfigProblems.put(relativePath, cachedProblems);
+                }
+            } else {
+                pathsToParse.add(path);
             }
         }
 
-        executor.shutdown();
+        questFileCache.keySet().removeIf(path -> !currentAbsolutePaths.contains(path));
+
+        Map<String, ParsedQuestFileResult> parsedResults = new HashMap<>();
+        if (!pathsToParse.isEmpty()) {
+            int threadCount = Math.max(1, Math.min(pathsToParse.size(), Runtime.getRuntime().availableProcessors()));
+            ExecutorService executor = Executors.newFixedThreadPool(threadCount);
+            List<Future<ParsedQuestFileResult>> futures = new ArrayList<>();
+
+            for (Path path : pathsToParse) {
+                futures.add(executor.submit(() -> parseQuestFile(path, root, macroSnapshot, macroSnapshotHash)));
+            }
+
+            for (Future<ParsedQuestFileResult> future : futures) {
+                try {
+                    ParsedQuestFileResult result = future.get();
+                    if (result == null) {
+                        continue;
+                    }
+
+                    parsedResults.put(result.getRelativePath(), result);
+                    questFileCache.put(result.getAbsolutePath(),
+                            new CachedQuestFile(result.getLastModified(), result.getMacroSnapshotHash(),
+                                    result.getQuestFileData() != null ? result.getQuestFileData().copy() : null,
+                                    result.getConfigProblems()));
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                } catch (ExecutionException e) {
+                    questsLogger.severe("An exception occurred when attempting to read a quest file (will be ignored)");
+                    e.getCause().printStackTrace();
+                }
+            }
+
+            executor.shutdown();
+        }
 
         for (Path path : questPaths) {
-            String relativePath = toRelativeQuestPath(root, path);
-            QuestFileData questFileData = concurrentQuestFiles.get(relativePath);
+            String relativePath = relativePathByPath.get(path);
+            if (relativePath == null) {
+                continue;
+            }
+
+            List<ConfigProblem> cachedProblems = reusedConfigProblems.get(relativePath);
+            if (cachedProblems != null && !cachedProblems.isEmpty()) {
+                configProblems.put(relativePath, cachedProblems);
+            }
+
+            QuestFileData questFileData = reusedQuestFiles.get(relativePath);
             if (questFileData != null) {
                 questFiles.put(relativePath, questFileData);
+                continue;
             }
-            List<ConfigProblem> problems = concurrentConfigProblems.get(relativePath);
-            if (problems != null && !problems.isEmpty()) {
-                configProblems.put(relativePath, new ArrayList<>(problems));
+
+            ParsedQuestFileResult result = parsedResults.get(relativePath);
+            if (result == null) {
+                continue;
+            }
+
+            if (!result.getConfigProblems().isEmpty()) {
+                configProblems.put(relativePath, new ArrayList<>(result.getConfigProblems()));
+            }
+
+            QuestFileData parsedQuestFileData = result.getQuestFileData();
+            if (parsedQuestFileData != null) {
+                questFiles.put(relativePath, parsedQuestFileData.copy());
             }
         }
-
-        concurrentConfigProblems.forEach((path, problems) -> {
-            if (!configProblems.containsKey(path)) {
-                configProblems.put(path, new ArrayList<>(problems));
-            }
-        });
 
         return new QuestParsingResult(questFiles, configProblems);
     }
 
-    private void parseQuestFile(Path path, File root, Map<String, String> macroSnapshot,
-                                ConcurrentMap<String, QuestFileData> questFiles,
-                                ConcurrentMap<String, List<ConfigProblem>> configProblems) {
+    private ParsedQuestFileResult parseQuestFile(Path path, File root, Map<String, String> macroSnapshot, int macroSnapshotHash) {
+        Path absolutePath = path.toAbsolutePath().normalize();
+        String relativePath = toRelativeQuestPath(root, path);
+        long lastModified;
         try {
-            String relativePath = toRelativeQuestPath(root, path);
+            lastModified = Files.getLastModifiedTime(path).toMillis();
+        } catch (IOException e) {
+            lastModified = -1L;
+        }
+
+        List<ConfigProblem> problems = new ArrayList<>();
+
+        try {
             String data = Files.readString(path, StandardCharsets.UTF_8);
             StringBuilder processed = new StringBuilder();
             Matcher matcher = MACRO_PATTERN.matcher(data);
@@ -205,23 +277,25 @@ public class BukkitQuestsLoader implements QuestsLoader {
             try {
                 config.loadFromString(processed.toString());
             } catch (InvalidConfigurationException ex) {
-                configProblems.computeIfAbsent(relativePath, key -> Collections.synchronizedList(new ArrayList<>()))
-                        .add(new ConfigProblem(
-                                ConfigProblem.ConfigProblemType.ERROR,
-                                ConfigProblemDescriptions.MALFORMED_YAML.getDescription(),
-                                ConfigProblemDescriptions.MALFORMED_YAML.getExtendedDescription(ex.getMessage())
-                        ));
-                return;
+                problems.add(new ConfigProblem(
+                        ConfigProblem.ConfigProblemType.ERROR,
+                        ConfigProblemDescriptions.MALFORMED_YAML.getDescription(),
+                        ConfigProblemDescriptions.MALFORMED_YAML.getExtendedDescription(ex.getMessage())
+                ));
+                return new ParsedQuestFileResult(absolutePath, relativePath, null, problems, lastModified, macroSnapshotHash);
             }
 
             String fileName = path.getFileName().toString();
             String id = fileName.replace(".yml", "");
 
-            questFiles.put(relativePath, new QuestFileData(id, relativePath, config));
+            return new ParsedQuestFileResult(absolutePath, relativePath,
+                    new QuestFileData(id, relativePath, config), problems, lastModified, macroSnapshotHash);
         } catch (Exception e) {
             questsLogger.severe("An exception occurred when attempting to read quest '" + path + "' (will be ignored)");
             e.printStackTrace();
         }
+
+        return new ParsedQuestFileResult(absolutePath, relativePath, null, problems, lastModified, macroSnapshotHash);
     }
 
     private static String toRelativeQuestPath(File root, Path path) {
@@ -556,6 +630,93 @@ public class BukkitQuestsLoader implements QuestsLoader {
         return macros;
     }
 
+    private static class ParsedQuestFileResult {
+
+        private final Path absolutePath;
+        private final String relativePath;
+        private final QuestFileData questFileData;
+        private final List<ConfigProblem> configProblems;
+        private final long lastModified;
+        private final int macroSnapshotHash;
+
+        private ParsedQuestFileResult(Path absolutePath, String relativePath, QuestFileData questFileData,
+                                      List<ConfigProblem> configProblems, long lastModified, int macroSnapshotHash) {
+            this.absolutePath = absolutePath;
+            this.relativePath = relativePath;
+            this.questFileData = questFileData;
+            if (configProblems != null && !configProblems.isEmpty()) {
+                this.configProblems = Collections.unmodifiableList(new ArrayList<>(configProblems));
+            } else {
+                this.configProblems = Collections.emptyList();
+            }
+            this.lastModified = lastModified;
+            this.macroSnapshotHash = macroSnapshotHash;
+        }
+
+        public Path getAbsolutePath() {
+            return absolutePath;
+        }
+
+        public String getRelativePath() {
+            return relativePath;
+        }
+
+        public QuestFileData getQuestFileData() {
+            return questFileData;
+        }
+
+        public List<ConfigProblem> getConfigProblems() {
+            return configProblems;
+        }
+
+        public long getLastModified() {
+            return lastModified;
+        }
+
+        public int getMacroSnapshotHash() {
+            return macroSnapshotHash;
+        }
+    }
+
+    private static class CachedQuestFile {
+
+        private final long lastModified;
+        private final int macroSnapshotHash;
+        private final QuestFileData questFileData;
+        private final List<ConfigProblem> configProblems;
+
+        private CachedQuestFile(long lastModified, int macroSnapshotHash, QuestFileData questFileData,
+                                List<ConfigProblem> configProblems) {
+            this.lastModified = lastModified;
+            this.macroSnapshotHash = macroSnapshotHash;
+            this.questFileData = questFileData;
+            if (configProblems != null && !configProblems.isEmpty()) {
+                this.configProblems = Collections.unmodifiableList(new ArrayList<>(configProblems));
+            } else {
+                this.configProblems = Collections.emptyList();
+            }
+        }
+
+        public long getLastModified() {
+            return lastModified;
+        }
+
+        public int getMacroSnapshotHash() {
+            return macroSnapshotHash;
+        }
+
+        public QuestFileData copyQuestFileData() {
+            if (questFileData == null) {
+                return null;
+            }
+            return questFileData.copy();
+        }
+
+        public List<ConfigProblem> getConfigProblemsCopy() {
+            return new ArrayList<>(configProblems);
+        }
+    }
+
     public static class QuestParsingResult {
 
         private final Map<String, QuestFileData> questFiles;
@@ -597,6 +758,16 @@ public class BukkitQuestsLoader implements QuestsLoader {
 
         public YamlConfiguration getConfig() {
             return config;
+        }
+
+        public QuestFileData copy() {
+            try {
+                YamlConfiguration clonedConfig = new YamlConfiguration();
+                clonedConfig.loadFromString(config.saveToString());
+                return new QuestFileData(questId, relativePath, clonedConfig);
+            } catch (InvalidConfigurationException e) {
+                throw new IllegalStateException("Unable to copy quest configuration for '" + relativePath + "'", e);
+            }
         }
     }
 

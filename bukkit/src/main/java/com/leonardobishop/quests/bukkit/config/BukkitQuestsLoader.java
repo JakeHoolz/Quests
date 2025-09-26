@@ -73,6 +73,7 @@ public class BukkitQuestsLoader implements QuestsLoader {
     private final QItemStackRegistry qItemStackRegistry;
     private final QuestItemRegistry questItemRegistry;
     private final Map<Path, CachedQuestFile> questFileCache = new ConcurrentHashMap<>();
+    private final Map<Path, CachedQuestItemFile> questItemCache = new ConcurrentHashMap<>();
 
     private static final Pattern MACRO_PATTERN = Pattern.compile("<\\$m\\s*([^ ]+)\\s*\\$>");
 
@@ -714,6 +715,25 @@ public class BukkitQuestsLoader implements QuestsLoader {
         }
     }
 
+    private static class CachedQuestItemFile {
+
+        private final long lastModified;
+        private final QuestItemFileData questItemFileData;
+
+        private CachedQuestItemFile(long lastModified, QuestItemFileData questItemFileData) {
+            this.lastModified = lastModified;
+            this.questItemFileData = questItemFileData;
+        }
+
+        public long getLastModified() {
+            return lastModified;
+        }
+
+        public QuestItemFileData getQuestItemFileData() {
+            return questItemFileData;
+        }
+    }
+
     public static class QuestParsingResult {
 
         private final Map<String, QuestFileData> questFiles;
@@ -783,8 +803,13 @@ public class BukkitQuestsLoader implements QuestsLoader {
         Map<String, QuestItemFileData> questItems = new LinkedHashMap<>();
 
         if (root == null || !root.exists()) {
+            questItemCache.clear();
             return new QuestItemParsingResult(questItems);
         }
+
+        List<Path> discoveredItemPaths = new ArrayList<>();
+        Map<Path, QuestItemFileData> resolvedQuestItems = new HashMap<>();
+        Set<Path> currentAbsolutePaths = new HashSet<>();
 
         FileVisitor<Path> fileVisitor = new SimpleFileVisitor<Path>() {
             @Override
@@ -795,19 +820,43 @@ public class BukkitQuestsLoader implements QuestsLoader {
                         return FileVisitResult.CONTINUE;
                     }
 
+                    Path absolutePath = path.toAbsolutePath().normalize();
+                    discoveredItemPaths.add(absolutePath);
+                    currentAbsolutePaths.add(absolutePath);
+
+                    long lastModified;
+                    try {
+                        lastModified = Files.getLastModifiedTime(absolutePath).toMillis();
+                    } catch (IOException e) {
+                        lastModified = -1L;
+                    }
+
+                    CachedQuestItemFile cachedQuestItemFile = questItemCache.get(absolutePath);
+                    if (cachedQuestItemFile != null && cachedQuestItemFile.getLastModified() == lastModified) {
+                        QuestItemFileData cachedQuestItem = cachedQuestItemFile.getQuestItemFileData();
+                        if (cachedQuestItem != null) {
+                            resolvedQuestItems.put(absolutePath, cachedQuestItem);
+                        }
+                        return FileVisitResult.CONTINUE;
+                    }
+
                     YamlConfiguration config = new YamlConfiguration();
                     try {
                         config.load(itemFile);
                     } catch (Exception ex) {
+                        questItemCache.remove(absolutePath);
                         return FileVisitResult.CONTINUE;
                     }
 
                     String id = itemFile.getName().replace(".yml", "");
                     if (!StringUtils.isAlphanumeric(id)) {
+                        questItemCache.remove(absolutePath);
                         return FileVisitResult.CONTINUE;
                     }
 
-                    questItems.put(id, new QuestItemFileData(id, path.toString(), config));
+                    QuestItemFileData questItemFileData = new QuestItemFileData(id, path.toString(), config);
+                    questItemCache.put(absolutePath, new CachedQuestItemFile(lastModified, questItemFileData));
+                    resolvedQuestItems.put(absolutePath, questItemFileData);
                 } catch (Exception e) {
                     questsLogger.severe("An exception occurred when attempting to read quest item '" + path + "' (will be ignored)");
                     e.printStackTrace();
@@ -820,6 +869,16 @@ public class BukkitQuestsLoader implements QuestsLoader {
             Files.walkFileTree(root.toPath(), fileVisitor);
         } catch (IOException e) {
             e.printStackTrace();
+        }
+
+        questItemCache.keySet().removeIf(path -> !currentAbsolutePaths.contains(path));
+
+        for (Path path : discoveredItemPaths) {
+            QuestItemFileData questItemFileData = resolvedQuestItems.get(path);
+            if (questItemFileData == null) {
+                continue;
+            }
+            questItems.put(questItemFileData.getId(), questItemFileData);
         }
 
         return new QuestItemParsingResult(questItems);

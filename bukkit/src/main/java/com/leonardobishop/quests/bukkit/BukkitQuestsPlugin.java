@@ -208,7 +208,7 @@ public class BukkitQuestsPlugin extends JavaPlugin implements Quests {
     private StorageProvider storageProvider;
 
     private boolean validConfiguration;
-    private Map<String, List<ConfigProblem>> configProblems;
+    private Map<String, List<ConfigProblem>> configProblems = Collections.emptyMap();
 
     private QItemStackRegistry qItemStackRegistry;
     private QuestItemRegistry questItemRegistry;
@@ -553,6 +553,7 @@ public class BukkitQuestsPlugin extends JavaPlugin implements Quests {
                 this.playerBlockTrackerHook.fixPlayerBlockTracker();
             }
 
+            configProblems = Collections.emptyMap();
             reloadQuests();
             if (!this.getConfigProblems().isEmpty()) {
                 questsLogger.warning("You have configuration issues preventing some quests from loading.");
@@ -654,6 +655,7 @@ public class BukkitQuestsPlugin extends JavaPlugin implements Quests {
 
     @Override
     public void reloadQuests() {
+        configProblems = Collections.emptyMap();
         if (this.reloadBaseConfiguration(false)) {
             BukkitQuestsLoader questsLoader = new BukkitQuestsLoader(this);
             File itemsFolder = new File(super.getDataFolder() + File.separator + "items");

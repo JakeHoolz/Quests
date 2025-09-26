@@ -541,22 +541,29 @@ public class BukkitQuestsLoader implements QuestsLoader {
     }
 
     /**
-     * Load quest items into the respective quest item registry.
+     * Parse quest item configuration files into an intermediate representation that can be registered later on the
+     * main server thread.
      *
      * @param root the directory to load from
+     * @return quest item parsing result
      */
-    public void loadQuestItems(File root) {
-        questItemRegistry.clearRegistry();
+    public QuestItemParsingResult parseQuestItems(File root) {
+        Map<String, QuestItemFileData> questItems = new LinkedHashMap<>();
+
+        if (root == null || !root.exists()) {
+            return new QuestItemParsingResult(questItems);
+        }
 
         FileVisitor<Path> fileVisitor = new SimpleFileVisitor<Path>() {
             @Override
             public FileVisitResult visitFile(Path path, BasicFileAttributes attributes) {
                 try {
                     File itemFile = new File(path.toUri());
-                    if (!itemFile.getName().toLowerCase().endsWith(".yml")) return FileVisitResult.CONTINUE;
+                    if (!itemFile.getName().toLowerCase().endsWith(".yml")) {
+                        return FileVisitResult.CONTINUE;
+                    }
 
                     YamlConfiguration config = new YamlConfiguration();
-                    // test file integrity
                     try {
                         config.load(itemFile);
                     } catch (Exception ex) {
@@ -564,64 +571,13 @@ public class BukkitQuestsLoader implements QuestsLoader {
                     }
 
                     String id = itemFile.getName().replace(".yml", "");
-
                     if (!StringUtils.isAlphanumeric(id)) {
                         return FileVisitResult.CONTINUE;
                     }
 
-                    QuestItem item;
-                    //TODO convert to registry based service
-                    switch (config.getString("type", "").toLowerCase()) {
-                        default:
-                            return FileVisitResult.CONTINUE;
-                        case "raw":
-                            item = new ParsedQuestItem("raw", id, config.getItemStack("item"));
-                            break;
-                        case "defined":
-                            item = new ParsedQuestItem("defined", id, plugin.getItemGetter().getItem("item", config));
-                            break;
-                        case "mmoitems":
-                            if (!Bukkit.getPluginManager().isPluginEnabled("MMOItems")) return FileVisitResult.CONTINUE;
-                            item = new MMOItemsQuestItem(id, config.getString("item.type"), config.getString("item.id"));
-                            break;
-                        case "slimefun":
-                            if (!Bukkit.getPluginManager().isPluginEnabled("Slimefun")) return FileVisitResult.CONTINUE;
-                            item = new SlimefunQuestItem(id, config.getString("item.id"));
-                            break;
-                        case "executableitems":
-                            if (!Bukkit.getPluginManager().isPluginEnabled("ExecutableItems")) return FileVisitResult.CONTINUE;
-                            item = new ExecutableItemsQuestItem(id, config.getString("item.id"));
-                            break;
-                        case "itemsadder":
-                            if (!Bukkit.getPluginManager().isPluginEnabled("ItemsAdder")) return FileVisitResult.CONTINUE;
-                            item = new ItemsAdderQuestItem(id, config.getString("item.id"));
-                            break;
-                        case "oraxen":
-                            if (!Bukkit.getPluginManager().isPluginEnabled("Oraxen")) return FileVisitResult.CONTINUE;
-                            item = new OraxenQuestItem(id, config.getString("item.id"));
-                            break;
-                        case "pyrofishingpro":
-                            if (!Bukkit.getPluginManager().isPluginEnabled("PyroFishingPro")) return FileVisitResult.CONTINUE;
-                            item = new PyroFishingProQuestItem(id, config.getInt("item.fish-number", -1), config.getString("item.tier"));
-                            break;
-                        case "nexo":
-                            if (!Bukkit.getPluginManager().isPluginEnabled("Nexo")) return FileVisitResult.CONTINUE;
-                            item = new NexoQuestItem(id, config.getString("item.id"));
-                            break;
-                        case "customfishing":
-                            if (!Bukkit.getPluginManager().isPluginEnabled("CustomFishing")) return FileVisitResult.CONTINUE;
-                            item = new CustomFishingQuestItem(id, config.contains("item.ids") ? config.getStringList("item.ids") : Collections.singletonList(config.getString("item.id")));
-                            break;
-                        case "evenmorefish":
-                            if (!Bukkit.getPluginManager().isPluginEnabled("EvenMoreFish")) return FileVisitResult.CONTINUE;
-                            item = new EvenMoreFishQuestItem(id, config.getString("item.rarity"), config.getString("item.fish"));
-                            break;
-                    }
-
-                    questItemRegistry.registerItem(id, item);
-
+                    questItems.put(id, new QuestItemFileData(id, path.toString(), config));
                 } catch (Exception e) {
-                    questsLogger.severe("An exception occurred when attempting to load quest item '" + path + "' (will be ignored)");
+                    questsLogger.severe("An exception occurred when attempting to read quest item '" + path + "' (will be ignored)");
                     e.printStackTrace();
                 }
                 return FileVisitResult.CONTINUE;
@@ -634,7 +590,135 @@ public class BukkitQuestsLoader implements QuestsLoader {
             e.printStackTrace();
         }
 
+        return new QuestItemParsingResult(questItems);
+    }
+
+    /**
+     * Register parsed quest items with the quest item registry. This method should run on the main server thread so
+     * that Bukkit API calls such as plugin manager lookups are thread-safe.
+     *
+     * @param parsingResult parsed quest item data
+     */
+    public void registerQuestItems(QuestItemParsingResult parsingResult) {
+        questItemRegistry.clearRegistry();
+
+        if (parsingResult == null) {
+            questsLogger.info("0 quest items have been registered.");
+            return;
+        }
+
+        parsingResult.getQuestItems().values().forEach(data -> {
+            try {
+                QuestItem questItem = createQuestItem(data);
+                if (questItem != null) {
+                    questItemRegistry.registerItem(data.getId(), questItem);
+                }
+            } catch (Exception e) {
+                questsLogger.severe("An exception occurred when attempting to load quest item '" + data.getSource() + "' (will be ignored)");
+                e.printStackTrace();
+            }
+        });
+
         questsLogger.info(questItemRegistry.getAllItems().size() + " quest items have been registered.");
+    }
+
+    private QuestItem createQuestItem(QuestItemFileData data) {
+        YamlConfiguration config = data.getConfig();
+        String type = config.getString("type", "").toLowerCase();
+        String id = data.getId();
+
+        switch (type) {
+            default:
+                return null;
+            case "raw":
+                return new ParsedQuestItem("raw", id, config.getItemStack("item"));
+            case "defined":
+                return new ParsedQuestItem("defined", id, plugin.getItemGetter().getItem("item", config));
+            case "mmoitems":
+                if (!Bukkit.getPluginManager().isPluginEnabled("MMOItems")) {
+                    return null;
+                }
+                return new MMOItemsQuestItem(id, config.getString("item.type"), config.getString("item.id"));
+            case "slimefun":
+                if (!Bukkit.getPluginManager().isPluginEnabled("Slimefun")) {
+                    return null;
+                }
+                return new SlimefunQuestItem(id, config.getString("item.id"));
+            case "executableitems":
+                if (!Bukkit.getPluginManager().isPluginEnabled("ExecutableItems")) {
+                    return null;
+                }
+                return new ExecutableItemsQuestItem(id, config.getString("item.id"));
+            case "itemsadder":
+                if (!Bukkit.getPluginManager().isPluginEnabled("ItemsAdder")) {
+                    return null;
+                }
+                return new ItemsAdderQuestItem(id, config.getString("item.id"));
+            case "oraxen":
+                if (!Bukkit.getPluginManager().isPluginEnabled("Oraxen")) {
+                    return null;
+                }
+                return new OraxenQuestItem(id, config.getString("item.id"));
+            case "pyrofishingpro":
+                if (!Bukkit.getPluginManager().isPluginEnabled("PyroFishingPro")) {
+                    return null;
+                }
+                return new PyroFishingProQuestItem(id, config.getInt("item.fish-number", -1), config.getString("item.tier"));
+            case "nexo":
+                if (!Bukkit.getPluginManager().isPluginEnabled("Nexo")) {
+                    return null;
+                }
+                return new NexoQuestItem(id, config.getString("item.id"));
+            case "customfishing":
+                if (!Bukkit.getPluginManager().isPluginEnabled("CustomFishing")) {
+                    return null;
+                }
+                List<String> ids = config.contains("item.ids") ? config.getStringList("item.ids") : Collections.singletonList(config.getString("item.id"));
+                return new CustomFishingQuestItem(id, ids);
+            case "evenmorefish":
+                if (!Bukkit.getPluginManager().isPluginEnabled("EvenMoreFish")) {
+                    return null;
+                }
+                return new EvenMoreFishQuestItem(id, config.getString("item.rarity"), config.getString("item.fish"));
+        }
+    }
+
+    public static class QuestItemParsingResult {
+
+        private final Map<String, QuestItemFileData> questItems;
+
+        public QuestItemParsingResult(Map<String, QuestItemFileData> questItems) {
+            this.questItems = questItems;
+        }
+
+        public Map<String, QuestItemFileData> getQuestItems() {
+            return questItems;
+        }
+    }
+
+    public static class QuestItemFileData {
+
+        private final String id;
+        private final String source;
+        private final YamlConfiguration config;
+
+        public QuestItemFileData(String id, String source, YamlConfiguration config) {
+            this.id = id;
+            this.source = source;
+            this.config = config;
+        }
+
+        public String getId() {
+            return id;
+        }
+
+        public String getSource() {
+            return source;
+        }
+
+        public YamlConfiguration getConfig() {
+            return config;
+        }
     }
 
     private void findInvalidTaskReferences(Quest quest, String s, List<ConfigProblem> configProblems, String location) {

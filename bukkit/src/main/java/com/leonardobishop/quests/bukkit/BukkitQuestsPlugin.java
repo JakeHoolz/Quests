@@ -661,10 +661,11 @@ public class BukkitQuestsPlugin extends JavaPlugin implements Quests {
             Map<String, String> macroSnapshot = questsLoader.createMacroSnapshot();
 
             this.serverScheduler.runTaskAsynchronously(() -> {
+                BukkitQuestsLoader.QuestItemParsingResult questItemParsingResult = questsLoader.parseQuestItems(itemsFolder);
                 BukkitQuestsLoader.QuestParsingResult parsingResult = questsLoader.parseQuestFiles(questsFolder, macroSnapshot);
 
                 this.serverScheduler.runTask(() -> {
-                    questsLoader.loadQuestItems(itemsFolder);
+                    questsLoader.registerQuestItems(questItemParsingResult);
                     configProblems = questsLoader.applyParsedQuests(parsingResult);
 
                     for (TaskType taskType : taskTypeManager.getTaskTypes()) {

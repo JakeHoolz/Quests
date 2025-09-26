@@ -157,7 +157,7 @@ public class BukkitQuestsLoader implements QuestsLoader {
             if (cachedQuestFile != null
                     && cachedQuestFile.getLastModified() == lastModified
                     && cachedQuestFile.getMacroSnapshotHash() == macroSnapshotHash) {
-                QuestFileData questFileData = cachedQuestFile.copyQuestFileData();
+                QuestFileData questFileData = cachedQuestFile.getQuestFileData();
                 if (questFileData != null) {
                     reusedQuestFiles.put(relativePath, questFileData);
                 }
@@ -190,10 +190,10 @@ public class BukkitQuestsLoader implements QuestsLoader {
                     }
 
                     parsedResults.put(result.getRelativePath(), result);
+                    QuestFileData questFileData = result.getQuestFileData();
                     questFileCache.put(result.getAbsolutePath(),
                             new CachedQuestFile(result.getLastModified(), result.getMacroSnapshotHash(),
-                                    result.getQuestFileData() != null ? result.getQuestFileData().copy() : null,
-                                    result.getConfigProblems()));
+                                    questFileData, result.getConfigProblems()));
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                     break;
@@ -234,7 +234,7 @@ public class BukkitQuestsLoader implements QuestsLoader {
 
             QuestFileData parsedQuestFileData = result.getQuestFileData();
             if (parsedQuestFileData != null) {
-                questFiles.put(relativePath, parsedQuestFileData.copy());
+                questFiles.put(relativePath, parsedQuestFileData);
             }
         }
 
@@ -705,11 +705,8 @@ public class BukkitQuestsLoader implements QuestsLoader {
             return macroSnapshotHash;
         }
 
-        public QuestFileData copyQuestFileData() {
-            if (questFileData == null) {
-                return null;
-            }
-            return questFileData.copy();
+        public QuestFileData getQuestFileData() {
+            return questFileData;
         }
 
         public List<ConfigProblem> getConfigProblemsCopy() {
@@ -736,6 +733,11 @@ public class BukkitQuestsLoader implements QuestsLoader {
         }
     }
 
+    /**
+     * Immutable quest file metadata and configuration snapshot.
+     * <p>
+     * The referenced {@link YamlConfiguration} must be treated as read-only by callers.
+     */
     public static class QuestFileData {
 
         private final String questId;
@@ -760,14 +762,13 @@ public class BukkitQuestsLoader implements QuestsLoader {
             return config;
         }
 
+        /**
+         * Returns a lightweight copy that shares the underlying {@link YamlConfiguration} instance.
+         * <p>
+         * Callers must treat the returned configuration as immutable; mutating it will affect any cached copies.
+         */
         public QuestFileData copy() {
-            try {
-                YamlConfiguration clonedConfig = new YamlConfiguration();
-                clonedConfig.loadFromString(config.saveToString());
-                return new QuestFileData(questId, relativePath, clonedConfig);
-            } catch (InvalidConfigurationException e) {
-                throw new IllegalStateException("Unable to copy quest configuration for '" + relativePath + "'", e);
-            }
+            return new QuestFileData(questId, relativePath, config);
         }
     }
 
